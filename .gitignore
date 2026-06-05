@@ -2,3 +2,4 @@ node_modules/
 server*.log
 .env
 .DS_Store
+data/

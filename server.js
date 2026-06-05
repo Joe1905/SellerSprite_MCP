@@ -11,9 +11,12 @@ const DEEPSEEK_MODEL = "deepseek-v4-flash";
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
 const SELLERSPRITE_SECRET_KEY = process.env.SELLERSPRITE_SECRET_KEY || "";
 const SELLERSPRITE_MCP_URL = "https://mcp.sellersprite.com/mcp";
-const PUBLIC_DIR = path.join(__dirname, "public-sellersprite");
+const PUBLIC_DIR = path.join(__dirname, "public");
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const SESSIONS_FILE = path.join(DATA_DIR, "sessions.json");
 
 const sessions = new Map();
+let saveTimer = null;
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -135,6 +138,69 @@ function findSession(sessionId) {
   return sessions.get(normalizeSessionId(sessionId));
 }
 
+function serializeSessions() {
+  return Array.from(sessions.values()).map((session) => ({
+    id: session.id,
+    title: session.title || "",
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    messages: session.messages || [],
+  }));
+}
+
+async function loadSessionsFromDisk() {
+  try {
+    const raw = await fs.readFile(SESSIONS_FILE, "utf8");
+    const saved = safeJsonParse(raw, []);
+    if (!Array.isArray(saved)) return;
+    for (const item of saved) {
+      const id = normalizeSessionId(item?.id);
+      const messages = Array.isArray(item?.messages) ? item.messages : [];
+      if (!messages.length) continue;
+      sessions.set(id, {
+        id,
+        title: String(item.title || ""),
+        createdAt: item.createdAt || new Date().toISOString(),
+        updatedAt: item.updatedAt || new Date().toISOString(),
+        messages,
+        sseClients: new Set(),
+      });
+    }
+    console.log(`Loaded ${sessions.size} persisted SellerSprite sessions.`);
+  } catch (error) {
+    if (error.code !== "ENOENT") console.warn(`Could not load sessions: ${error.message}`);
+  }
+}
+
+async function saveSessionsToDisk() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  const payload = JSON.stringify(serializeSessions(), null, 2);
+  await fs.writeFile(SESSIONS_FILE, payload, "utf8");
+}
+
+function scheduleSessionSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveSessionsToDisk().catch((error) => console.warn(`Could not save sessions: ${error.message}`));
+  }, 100);
+}
+
+function installShutdownSave() {
+  const shutdown = async (signal) => {
+    try {
+      clearTimeout(saveTimer);
+      await saveSessionsToDisk();
+    } catch (error) {
+      console.warn(`Could not save sessions before shutdown: ${error.message}`);
+    } finally {
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    }
+  };
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+}
+
 function sendJson(res, status, payload) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(payload));
@@ -186,6 +252,7 @@ function addMessage(session, message) {
   session.messages.push(message);
   session.updatedAt = new Date().toISOString();
   broadcast(session, "message", message);
+  scheduleSessionSave();
   return message;
 }
 
@@ -195,6 +262,7 @@ function updateMessage(session, id, patch) {
   Object.assign(message, patch);
   session.updatedAt = new Date().toISOString();
   broadcast(session, "message", message);
+  scheduleSessionSave();
   return message;
 }
 
@@ -465,6 +533,7 @@ function handleClearMessages(res, session) {
   session.messages.splice(0);
   session.updatedAt = new Date().toISOString();
   broadcast(session, "clear", { ok: true });
+  scheduleSessionSave();
   sendJson(res, 200, { ok: true });
 }
 
@@ -474,6 +543,7 @@ function handleDeleteSession(res, sessionId) {
     broadcast(session, "deleted", { ok: true, sessionId });
     for (const client of session.sseClients) client.end();
     sessions.delete(normalizeSessionId(sessionId));
+    scheduleSessionSave();
   }
   sendJson(res, 200, { ok: true });
 }
@@ -564,7 +634,11 @@ const server = http.createServer((req, res) => {
   res.end("Method not allowed");
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`SellerSprite MCP + DeepSeek chat running at http://localhost:${PORT}`);
-  for (const url of lanUrls()) console.log(`LAN: ${url}`);
+loadSessionsFromDisk().then(() => {
+  installShutdownSave();
+  server.listen(PORT, HOST, () => {
+    console.log(`SellerSprite MCP + DeepSeek chat running at http://localhost:${PORT}`);
+    for (const url of lanUrls()) console.log(`LAN: ${url}`);
+    console.log(`Session data: ${SESSIONS_FILE}`);
+  });
 });
