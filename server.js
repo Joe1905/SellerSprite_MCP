@@ -285,6 +285,36 @@ function listSessions() {
     .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 }
 
+function getMessagesPage(session, url) {
+  const all = session?.messages || [];
+  const maxChars = Math.min(Math.max(Number(url.searchParams.get("maxChars") || 20000), 2000), 100000);
+  const before = url.searchParams.get("before");
+  let end = all.length;
+  if (before) {
+    const index = all.findIndex((message) => message.id === before);
+    end = index >= 0 ? index : all.length;
+  }
+  let start = end;
+  let usedChars = 0;
+  while (start > 0) {
+    const message = all[start - 1];
+    const messageChars = JSON.stringify(message).length;
+    if (usedChars > 0 && usedChars + messageChars > maxChars) break;
+    usedChars += messageChars;
+    start -= 1;
+  }
+  const messages = all.slice(start, end);
+  return {
+    ok: true,
+    messages,
+    total: all.length,
+    usedChars,
+    maxChars,
+    hasMore: start > 0,
+    nextBefore: messages[0]?.id || null,
+  };
+}
+
 function summarizeSessionTitle(text) {
   const clean = String(text || "").replace(/\s+/g, " ").trim();
   if (!clean) return "Untitled";
@@ -619,7 +649,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && url.pathname === "/api/sessions") return sendJson(res, 200, { ok: true, sessions: listSessions() });
   const sessionId = getSessionIdFromUrl(url);
   const existingSession = findSession(sessionId);
-  if (req.method === "GET" && url.pathname === "/api/messages") return sendJson(res, 200, { ok: true, messages: existingSession?.messages || [] });
+  if (req.method === "GET" && url.pathname === "/api/messages") return sendJson(res, 200, getMessagesPage(existingSession, url));
   if (req.method === "GET" && url.pathname === "/api/guide") {
     return sendJson(res, 200, { ok: true, guide: createMessage("assistant", USER_GUIDE_MESSAGE, { id: "guide", status: "done" }) });
   }

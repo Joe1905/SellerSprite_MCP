@@ -173,7 +173,11 @@
       const status = document.querySelector("#status");
       const rendered = new Map();
       const pendingAttachments = [];
+      const MESSAGE_PAGE_CHARS = 20000;
       let eventSource = null;
+      let hasMoreMessages = false;
+      let nextBeforeMessage = null;
+      let loadingOlderMessages = false;
 
       function makeId() {
         if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
@@ -197,9 +201,12 @@
         sessionLabel.textContent = sessionId;
       }
 
-      function api(path) {
+      function api(path, params = {}) {
         const next = new URL(path, window.location.origin);
         next.searchParams.set("session", sessionId);
+        Object.entries(params).forEach(([key, value]) => {
+          if (value !== undefined && value !== null && value !== "") next.searchParams.set(key, value);
+        });
         return next.pathname + next.search;
       }
 
@@ -297,12 +304,13 @@
         article.append(text);
       }
 
-      function upsertMessage(message, shouldScroll = true) {
+      function upsertMessage(message, shouldScroll = true, position = "append") {
         let article = rendered.get(message.id);
         if (!article) {
           article = document.createElement("article");
           rendered.set(message.id, article);
-          messages.append(article);
+          if (position === "prepend") messages.prepend(article);
+          else messages.append(article);
         }
         article.className = `message ${message.role === "user" ? "user" : ""} ${message.status === "error" ? "error" : ""} ${message.status === "pending" ? "pending" : ""}`.trim();
         renderContent(article, message);
@@ -348,14 +356,32 @@
       }
 
       async function loadMessages() {
-        const response = await fetch(api("/api/messages"));
+        const response = await fetch(api("/api/messages", { maxChars: MESSAGE_PAGE_CHARS }));
         const result = await response.json();
         messages.innerHTML = "";
         rendered.clear();
+        hasMoreMessages = Boolean(result.hasMore);
+        nextBeforeMessage = result.nextBefore || null;
         result.messages.forEach((message) => upsertMessage(message, false));
         if (!result.messages.length) return showGuideMessage();
         const latest = rendered.get(result.messages.at(-1).id);
         if (latest) scrollMessageToTop(latest);
+      }
+
+      async function loadOlderMessages() {
+        if (!hasMoreMessages || !nextBeforeMessage || loadingOlderMessages) return;
+        loadingOlderMessages = true;
+        const previousHeight = messages.scrollHeight;
+        try {
+          const response = await fetch(api("/api/messages", { before: nextBeforeMessage, maxChars: MESSAGE_PAGE_CHARS }));
+          const result = await response.json();
+          hasMoreMessages = Boolean(result.hasMore);
+          nextBeforeMessage = result.nextBefore || null;
+          [...result.messages].reverse().forEach((message) => upsertMessage(message, false, "prepend"));
+          messages.scrollTop += messages.scrollHeight - previousHeight;
+        } finally {
+          loadingOlderMessages = false;
+        }
       }
 
       async function loadSessions() {
@@ -427,6 +453,8 @@
         eventSource.addEventListener("clear", () => {
           messages.innerHTML = "";
           rendered.clear();
+          hasMoreMessages = false;
+          nextBeforeMessage = null;
           showGuideMessage().catch(() => {});
           loadSessions().catch(() => {});
         });
@@ -474,6 +502,9 @@
           form.requestSubmit();
         }
       });
+      messages.addEventListener("scroll", () => {
+        if (messages.scrollTop <= 24) loadOlderMessages().catch(() => {});
+      });
       upload.addEventListener("click", () => imageInput.click());
       imageInput.addEventListener("change", () => {
         addFiles(imageInput.files).catch((error) => upsertMessage({ id: `client-error-${Date.now()}`, role: "assistant", status: "error", createdAt: new Date().toISOString(), content: error.message }));
@@ -492,6 +523,8 @@
         setSession(makeId());
         messages.innerHTML = "";
         rendered.clear();
+        hasMoreMessages = false;
+        nextBeforeMessage = null;
         connectEvents();
         showGuideMessage().catch(() => {});
         loadSessions().catch(() => {});
