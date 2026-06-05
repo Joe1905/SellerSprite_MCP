@@ -273,6 +273,58 @@ function toDeepSeekTool(tool) {
   };
 }
 
+function parseSellerSpriteToolPayload(result) {
+  const text = result?.content?.find((item) => item?.type === "text")?.text;
+  if (!text) return null;
+  const parsed = safeJsonParse(text, null);
+  return parsed && typeof parsed === "object" ? parsed : null;
+}
+
+function getSellerSpriteToolError(result) {
+  if (result?.isError) return { code: "MCP_TOOL_ERROR", message: "SellerSprite MCP 工具返回错误。" };
+  const payload = parseSellerSpriteToolPayload(result);
+  if (!payload) return null;
+  const code = String(payload.code || "");
+  const message = String(payload.message || "");
+  if (code.startsWith("ERROR") || code.includes("UNAUTHORIZED") || message.includes("未授权")) {
+    return { code: code || "SELLERSPRITE_ERROR", message: message || "SellerSprite MCP 工具返回错误。", data: payload.data ?? null };
+  }
+  return null;
+}
+
+function formatToolError(toolName, error) {
+  if (error?.code === "ERROR_UNAUTHORIZED" || error?.message?.includes("未授权")) {
+    return [
+      "### SellerSprite MCP 授权异常",
+      "",
+      `工具 \`${toolName}\` 返回：\`${error.code || "ERROR"}\`，${error.message || "未授权"}。`,
+      "",
+      "这不是前端显示问题，也不是 DeepSeek 初始回复问题；是 SellerSprite MCP 在实际工具调用阶段拒绝了请求。",
+      "",
+      "请检查：",
+      "- 当前 `SELLERSPRITE_SECRET_KEY` 是否仍有效。",
+      "- 该密钥对应账号是否有调用这个工具/API 的权限。",
+      "- SellerSprite 后台是否需要重新生成或绑定 MCP secret。",
+      "",
+      "我不会基于未授权结果编造实时市场数据。授权恢复后再发送同样的问题即可继续查询。",
+    ].join("\n");
+  }
+
+  return [
+    "### SellerSprite MCP 工具调用失败",
+    "",
+    `工具 \`${toolName}\` 返回：\`${error?.code || "ERROR"}\`，${error?.message || "未知错误"}。`,
+    "",
+    "请调整参数或稍后重试。",
+  ].join("\n");
+}
+
+function shouldRequireSellerSpriteTool(text) {
+  return /Amazon|亚马逊|ASIN|asin|关键词|产品|商品|类目|市场|选品|销量|销售额|BSR|竞品|品牌|评论|流量|趋势|抓取|查询|分析|US|UK|DE|JP|智能|家居/i.test(
+    String(text || "")
+  );
+}
+
 async function callDeepSeek(payload) {
   if (!DEEPSEEK_API_KEY) throw new Error("请先设置环境变量 DEEPSEEK_API_KEY。");
 
@@ -299,7 +351,7 @@ async function answerWithDeepSeek(session, userText) {
     {
       role: "system",
       content:
-        "你是 SellerSprite Open API 的中文助手。用户询问 Amazon 选品、ASIN、关键词、品牌、类目、销量、BSR、流量、趋势、OCR 或账户工具能力时，优先调用 SellerSprite MCP 工具。不要编造工具返回中没有的数据；缺少必填参数时先问用户补充。回复可以使用 Markdown。",
+        "你是 SellerSprite Open API 的中文助手。用户询问 Amazon 选品、ASIN、关键词、品牌、类目、销量、BSR、流量、趋势、OCR 或账户工具能力时，必须优先调用 SellerSprite MCP 工具。不要编造工具返回中没有的数据；如果工具返回未授权、错误或空数据，必须明确说明真实错误，不要给出伪造的实时市场数据；如果你没有实际调用工具，不得声称 API 未授权、次数用尽、已查询到数据或工具异常，只能说明需要调用工具查询。缺少必填参数时先问用户补充。回复可以使用 Markdown。",
     },
     ...history,
     { role: "user", content: userText },
@@ -307,6 +359,7 @@ async function answerWithDeepSeek(session, userText) {
   const deepseekResponses = [];
   const toolResults = [];
   let firstRequest = null;
+  const requireToolFirst = shouldRequireSellerSpriteTool(userText);
 
   for (let step = 0; step < 6; step += 1) {
     const response = await callDeepSeek({
@@ -321,6 +374,24 @@ async function answerWithDeepSeek(session, userText) {
     conversation.push(assistant);
     const toolCalls = Array.isArray(assistant.tool_calls) ? assistant.tool_calls : [];
     if (!toolCalls.length) {
+      if (requireToolFirst && step === 0) {
+        return {
+          content: [
+            "### 需要实际调用 SellerSprite MCP",
+            "",
+            "这个问题属于 Amazon/SellerSprite 数据查询，必须先调用 MCP 工具才能给出结果。",
+            "",
+            "本轮 DeepSeek 没有选择任何工具，因此我不会采纳它的直接回答，也不会编造授权、次数或市场数据。",
+            "",
+            "你可以补充更明确的查询条件后重试，例如：",
+            "- 站点：US",
+            "- ASIN、关键词或类目节点",
+            "- 想查的维度：产品列表、类目结构、关键词、销量、竞品等",
+          ].join("\n"),
+          request: firstRequest,
+          raw: { deepseek: deepseekResponses, toolResults },
+        };
+      }
       return { content: assistant.content || "我没有拿到有效回复。", request: firstRequest, raw: { deepseek: deepseekResponses, toolResults } };
     }
 
@@ -328,9 +399,19 @@ async function answerWithDeepSeek(session, userText) {
       const name = toolCall.function?.name;
       const args = safeJsonParse(toolCall.function?.arguments, {});
       const result = await mcpClient.callTool(name, args);
-      const wrapped = { ok: !result.isError, status: result.isError ? 400 : 200, request: { method: "MCP", apiPath: name }, data: result };
+      const toolError = getSellerSpriteToolError(result);
+      const wrapped = {
+        ok: !toolError,
+        status: toolError ? 400 : 200,
+        request: { method: "MCP", apiPath: name },
+        error: toolError,
+        data: result,
+      };
       if (!firstRequest) firstRequest = wrapped.request;
       toolResults.push({ toolCall, args, result: wrapped });
+      if (toolError) {
+        return { content: formatToolError(name, toolError), request: firstRequest, raw: { deepseek: deepseekResponses, toolResults } };
+      }
       conversation.push({ role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(wrapped) });
     }
   }
