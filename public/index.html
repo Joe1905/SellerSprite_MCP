@@ -76,6 +76,17 @@
       .danger-button { margin-top: 12px; border-color: #f2b8b5; color: var(--danger); }
       .danger-button:hover { background: #fff4f3; }
       .messages { min-height: 0; overflow-y: scroll; padding: 24px; scrollbar-gutter: stable; }
+      .load-more {
+        display: none;
+        margin: 0 auto 18px;
+        border: 1px solid #b7d6cf;
+        background: white;
+        color: var(--accent-strong);
+        padding: 8px 14px;
+        font-size: 13px;
+      }
+      .load-more:hover { background: #edf8f5; }
+      .load-more.visible { display: block; }
       .message { max-width: min(840px, 80%); margin-bottom: 24px; border: 1px solid #cfd7e3; border-radius: 8px; background: white; padding: 16px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04); }
       .message.user { margin-left: auto; border-color: #a9d8cf; background: var(--soft); }
       .message.error { border-color: #f4b4ad; background: #fff7f6; }
@@ -145,7 +156,9 @@
           <h1>&#23616;&#22495;&#32593;&#20849;&#20139;&#23545;&#35805;</h1>
           <p class="hint">&#21516;&#19968; session &#20869;&#21516;&#27493;&#28040;&#24687;&#65307;&#28857;&#20987;&#8220;&#26032;&#22686;&#31383;&#21475;&#8221;&#20250;&#25171;&#24320;&#29420;&#31435;&#19978;&#19979;&#25991;&#12290;Enter &#21457;&#36865;&#65292;Shift+Enter &#25442;&#34892;&#12290;</p>
         </header>
-        <section id="messages" class="messages" aria-live="polite"></section>
+        <section id="messages" class="messages" aria-live="polite">
+          <button id="load-more" class="load-more" type="button">加载更早消息</button>
+        </section>
         <form id="chat-form">
           <input id="image-input" class="file-input" type="file" accept="image/*" multiple />
           <button id="upload" class="icon-button" type="button" title="upload image" aria-label="upload image">+</button>
@@ -170,6 +183,7 @@
       const imageInput = document.querySelector("#image-input");
       const attachmentPreview = document.querySelector("#attachment-preview");
       const messages = document.querySelector("#messages");
+      const loadMore = document.querySelector("#load-more");
       const status = document.querySelector("#status");
       const rendered = new Map();
       const pendingAttachments = [];
@@ -267,6 +281,18 @@
         requestAnimationFrame(() => { messages.scrollTop = article.offsetTop - messages.offsetTop; });
       }
 
+      function resetMessageList() {
+        messages.innerHTML = "";
+        messages.append(loadMore);
+        rendered.clear();
+      }
+
+      function updateLoadMoreButton() {
+        loadMore.classList.toggle("visible", hasMoreMessages || loadingOlderMessages);
+        loadMore.disabled = loadingOlderMessages || !hasMoreMessages;
+        loadMore.textContent = loadingOlderMessages ? "加载中..." : "加载更早消息";
+      }
+
       async function fetchGuideMessage() {
         const response = await fetch(api("/api/guide"));
         const result = await response.json();
@@ -309,7 +335,7 @@
         if (!article) {
           article = document.createElement("article");
           rendered.set(message.id, article);
-          if (position === "prepend") messages.prepend(article);
+          if (position === "prepend") loadMore.after(article);
           else messages.append(article);
         }
         article.className = `message ${message.role === "user" ? "user" : ""} ${message.status === "error" ? "error" : ""} ${message.status === "pending" ? "pending" : ""}`.trim();
@@ -358,10 +384,10 @@
       async function loadMessages() {
         const response = await fetch(api("/api/messages", { maxChars: MESSAGE_PAGE_CHARS }));
         const result = await response.json();
-        messages.innerHTML = "";
-        rendered.clear();
+        resetMessageList();
         hasMoreMessages = Boolean(result.hasMore);
         nextBeforeMessage = result.nextBefore || null;
+        updateLoadMoreButton();
         result.messages.forEach((message) => upsertMessage(message, false));
         if (!result.messages.length) return showGuideMessage();
         const latest = rendered.get(result.messages.at(-1).id);
@@ -371,6 +397,7 @@
       async function loadOlderMessages() {
         if (!hasMoreMessages || !nextBeforeMessage || loadingOlderMessages) return;
         loadingOlderMessages = true;
+        updateLoadMoreButton();
         const previousHeight = messages.scrollHeight;
         try {
           const response = await fetch(api("/api/messages", { before: nextBeforeMessage, maxChars: MESSAGE_PAGE_CHARS }));
@@ -381,6 +408,7 @@
           messages.scrollTop += messages.scrollHeight - previousHeight;
         } finally {
           loadingOlderMessages = false;
+          updateLoadMoreButton();
         }
       }
 
@@ -451,10 +479,10 @@
           loadSessions().catch(() => {});
         });
         eventSource.addEventListener("clear", () => {
-          messages.innerHTML = "";
-          rendered.clear();
+          resetMessageList();
           hasMoreMessages = false;
           nextBeforeMessage = null;
+          updateLoadMoreButton();
           showGuideMessage().catch(() => {});
           loadSessions().catch(() => {});
         });
@@ -505,6 +533,7 @@
       messages.addEventListener("scroll", () => {
         if (messages.scrollTop <= 24) loadOlderMessages().catch(() => {});
       });
+      loadMore.addEventListener("click", () => loadOlderMessages().catch(() => {}));
       upload.addEventListener("click", () => imageInput.click());
       imageInput.addEventListener("change", () => {
         addFiles(imageInput.files).catch((error) => upsertMessage({ id: `client-error-${Date.now()}`, role: "assistant", status: "error", createdAt: new Date().toISOString(), content: error.message }));
@@ -521,10 +550,10 @@
       });
       newSession.addEventListener("click", () => {
         setSession(makeId());
-        messages.innerHTML = "";
-        rendered.clear();
+        resetMessageList();
         hasMoreMessages = false;
         nextBeforeMessage = null;
+        updateLoadMoreButton();
         connectEvents();
         showGuideMessage().catch(() => {});
         loadSessions().catch(() => {});
@@ -534,6 +563,7 @@
         button.addEventListener("click", () => { input.value = button.dataset.text; input.focus(); });
       });
 
+      updateLoadMoreButton();
       Promise.all([loadMessages(), loadSessions()]).then(connectEvents).catch((error) => {
         status.textContent = "sync init failed";
         upsertMessage({ id: "init-error", role: "assistant", status: "error", createdAt: new Date().toISOString(), content: error.message || "init failed" });
