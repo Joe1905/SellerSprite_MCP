@@ -417,6 +417,95 @@ function formatToolError(toolName, error) {
   ].join("\n");
 }
 
+function parseWrappedToolData(wrapped) {
+  const text = wrapped?.data?.content?.find((item) => item?.type === "text")?.text;
+  const parsed = text ? safeJsonParse(text, null) : null;
+  return parsed && typeof parsed === "object" ? parsed : null;
+}
+
+function formatValue(value, suffix = "") {
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "number") return `${value.toLocaleString("en-US")}${suffix}`;
+  return `${value}${suffix}`;
+}
+
+function latestRecoverableToolResult(session) {
+  const messages = [...(session?.messages || [])].reverse();
+  return messages.find((message) => {
+    const results = message?.raw?.toolResults;
+    return (
+      message.role === "assistant" &&
+      Array.isArray(results) &&
+      results.some((item) => item?.result?.ok) &&
+      results.some((item) => item?.result?.ok === false)
+    );
+  });
+}
+
+function buildRecoveredAnswer(message) {
+  const toolResults = message?.raw?.toolResults || [];
+  const successful = toolResults.filter((item) => item?.result?.ok);
+  const failed = toolResults.filter((item) => item?.result?.ok === false);
+  const statsTool = successful.find((item) => {
+    const name = item?.toolCall?.function?.name || "";
+    return name.includes("statistics") || name === "market_research";
+  });
+  const statsPayload = parseWrappedToolData(statsTool?.result);
+  const stats = statsPayload?.data && typeof statsPayload.data === "object" ? statsPayload.data : null;
+  const nodeTool = successful.find((item) => item?.toolCall?.function?.name === "product_node");
+  const nodePayload = parseWrappedToolData(nodeTool?.result);
+  const firstNode = Array.isArray(nodePayload?.data) ? nodePayload.data[0] : null;
+
+  const title = stats?.nodeLabelPathLocale || stats?.nodeLabelPath || firstNode?.nodeLabelPathLocale || firstNode?.nodeLabelPath || "已识别类目";
+  const rows = [
+    ["类目路径", title],
+    ["商品样本数", stats?.products ?? stats?.totalProducts],
+    ["品牌数", stats?.brands],
+    ["卖家数", stats?.sellers],
+    ["平均月销量", stats?.avgUnits],
+    ["平均月销售额", stats?.avgRevenue === undefined ? undefined : `$${formatValue(stats.avgRevenue)}`],
+    ["平均售价", stats?.avgPrice === undefined ? undefined : `$${formatValue(stats.avgPrice)}`],
+    ["平均评分", stats?.avgRating],
+    ["平均评分数", stats?.avgRatings],
+    ["平均利润率", stats?.avgProfit === undefined ? undefined : `${formatValue(stats.avgProfit)}%`],
+    ["新品数量", stats?.newProducts],
+    ["新品占比", stats?.newProductProportion === undefined ? undefined : `${formatValue(stats.newProductProportion)}%`],
+    ["新品平均销量", stats?.newAvgUnits],
+    ["新品平均销售额", stats?.newAvgRevenue === undefined ? undefined : `$${formatValue(stats.newAvgRevenue)}`],
+    ["最早上架", stats?.firstShelfDate],
+    ["最新上架", stats?.lastShelfDate],
+  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
+
+  const failedLines = failed.map((item) => {
+    const name = item?.toolCall?.function?.name || item?.result?.request?.apiPath || "unknown_tool";
+    const code = item?.result?.error?.code || "ERROR";
+    return `- \`${name}\`: \`${code}\``;
+  });
+
+  return [
+    "### 降级分析结果（基于已成功返回的数据）",
+    "",
+    "上一轮部分补充工具失败，但已有核心查询结果可用。下面不重新消耗 SellerSprite 次数，只基于已成功返回的数据整理：",
+    "",
+    "| 指标 | 数据 |",
+    "|---|---:|",
+    ...rows.map(([label, value]) => `| ${label} | ${formatValue(value)} |`),
+    "",
+    "### 初步判断",
+    "",
+    `- 该类目可先按 \`${title}\` 作为分析口径。`,
+    `- 样本商品数为 ${formatValue(stats?.products ?? stats?.totalProducts)}，品牌数 ${formatValue(stats?.brands)}，卖家数 ${formatValue(stats?.sellers)}，竞争主体并不少。`,
+    `- 平均售价约 ${stats?.avgPrice === undefined ? "-" : `$${formatValue(stats.avgPrice)}`}，平均利润率约 ${stats?.avgProfit === undefined ? "-" : `${formatValue(stats.avgProfit)}%`}，可以作为初步价格和毛利参考。`,
+    `- 新品占比约 ${stats?.newProductProportion === undefined ? "-" : `${formatValue(stats.newProductProportion)}%`}，说明该类目仍有新品进入，但需要结合具体竞品和价格分布进一步确认。`,
+    "",
+    "### 本轮已跳过的失败数据",
+    "",
+    failedLines.length ? failedLines.join("\n") : "- 无",
+    "",
+    "以上失败工具返回的是 SellerSprite MCP 内部错误，不代表前面成功返回的数据无效；后续可以等接口恢复后再补查价格分布、竞品列表等细分数据。",
+  ].join("\n");
+}
+
 function isBlockingToolError(error, successfulToolCount) {
   const code = String(error?.code || "");
   const message = String(error?.message || "");
@@ -583,6 +672,29 @@ function handleClearMessages(res, session) {
   sendJson(res, 200, { ok: true });
 }
 
+function handleRecoverLast(res, session) {
+  if (!session) {
+    sendJson(res, 404, { ok: false, error: "Session not found" });
+    return;
+  }
+
+  const source = latestRecoverableToolResult(session);
+  if (!source) {
+    sendJson(res, 404, { ok: false, error: "No recoverable tool result found" });
+    return;
+  }
+
+  const message = addMessage(
+    session,
+    createMessage("assistant", buildRecoveredAnswer(source), {
+      status: "done",
+      request: source.request || null,
+      raw: { recoveredFrom: source.id },
+    })
+  );
+  sendJson(res, 200, { ok: true, message });
+}
+
 function handleDeleteSession(res, sessionId) {
   const session = findSession(sessionId);
   if (session) {
@@ -671,6 +783,7 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/events") return handleEvents(req, res, existingSession);
   if (req.method === "POST" && url.pathname === "/api/messages/clear") return handleClearMessages(res, existingSession);
+  if (req.method === "POST" && url.pathname === "/api/recover-last") return handleRecoverLast(res, existingSession);
   if (req.method === "DELETE" && url.pathname === "/api/session") return handleDeleteSession(res, sessionId);
   if (req.method === "POST" && url.pathname === "/mcp") {
     return handleMcp(req, res).catch((error) => sendJson(res, 500, { jsonrpc: "2.0", id: null, error: { code: -32603, message: error.message || "MCP server error" } }));
