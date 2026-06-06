@@ -417,6 +417,14 @@ function formatToolError(toolName, error) {
   ].join("\n");
 }
 
+function isBlockingToolError(error, successfulToolCount) {
+  const code = String(error?.code || "");
+  const message = String(error?.message || "");
+  if (code === "ERROR_UNAUTHORIZED" || code.includes("UNAUTHORIZED") || message.includes("未授权")) return true;
+  if (message.includes("没有可使用的次数") || message.includes("当前没有可使用的次数")) return true;
+  return successfulToolCount <= 0;
+}
+
 function shouldRequireSellerSpriteTool(text) {
   return /Amazon|亚马逊|ASIN|asin|关键词|产品|商品|类目|市场|选品|销量|销售额|BSR|竞品|品牌|评论|流量|趋势|抓取|查询|分析|US|UK|DE|JP|智能|家居/i.test(
     String(text || "")
@@ -458,6 +466,11 @@ async function answerWithDeepSeek(session, userText) {
   const toolResults = [];
   let firstRequest = null;
   const requireToolFirst = shouldRequireSellerSpriteTool(userText);
+  conversation.splice(1, 0, {
+    role: "system",
+    content:
+      "When a SellerSprite tool result has ok:false but at least one previous SellerSprite tool result has ok:true, continue using only the successful tool data. Mention the failed tool name and error code briefly at the end as skipped data. Do not invent missing values from failed tools.",
+  });
 
   for (let step = 0; step < 6; step += 1) {
     const response = await callDeepSeek({
@@ -508,7 +521,10 @@ async function answerWithDeepSeek(session, userText) {
       if (!firstRequest) firstRequest = wrapped.request;
       toolResults.push({ toolCall, args, result: wrapped });
       if (toolError) {
-        return { content: formatToolError(name, toolError), request: firstRequest, raw: { deepseek: deepseekResponses, toolResults } };
+        const successfulToolCount = toolResults.filter((item) => item?.result?.ok).length;
+        if (isBlockingToolError(toolError, successfulToolCount)) {
+          return { content: formatToolError(name, toolError), request: firstRequest, raw: { deepseek: deepseekResponses, toolResults } };
+        }
       }
       conversation.push({ role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(wrapped) });
     }
